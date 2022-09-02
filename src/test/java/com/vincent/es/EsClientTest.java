@@ -21,8 +21,7 @@ import org.springframework.test.context.junit4.SpringRunner;
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -311,6 +310,132 @@ public class EsClientTest {
         assertDocumentIds(false, searchRes, "103", "102");
     }
 
+    @Test
+    public void testFieldValueFactorScore() throws IOException {
+        var students = SampleData.get();
+        createDocuments(students);
+
+        var fieldValueFactorFunc = new FieldValueFactorScoreFunction.Builder()
+                .field("grade")
+                .factor(0.5)
+                .modifier(FieldValueFactorModifier.Square)
+                .missing(0.0)
+                .build()
+                ._toFunctionScore();
+
+        var expectedScore = Map.of(
+                "101", 4.0,
+                "102", 2.25,
+                "103", 1.0,
+                "104", 0.25
+        );
+
+        var searchRes = search(List.of(fieldValueFactorFunc));
+        assertDocumentScore(searchRes, expectedScore);
+    }
+
+    @Test
+    public void testFilterAndWeightScore() throws IOException {
+        var students = SampleData.get();
+        createDocuments(students);
+
+        var departmentQuery = TermQuery.of(b ->
+                        b.field("department.keyword").value("財務金融"))
+                ._toQuery();
+        var departmentFunc = new FunctionScore.Builder()
+                .filter(departmentQuery)
+                .weight(3.0)
+                .build();
+
+        var courseQuery = TermQuery.of(b ->
+                        b.field("courses.name.keyword").value("程式設計"))
+                ._toQuery();
+        var courseFunc = new FunctionScore.Builder()
+                .filter(courseQuery)
+                .weight(1.5)
+                .build();
+
+        var gradeFactor = new FieldValueFactorScoreFunction.Builder()
+                .field("grade")
+                .build();
+        var gradeFunc = new FunctionScore.Builder()
+                .fieldValueFactor(gradeFactor)
+                .weight(0.5)
+                .build();
+
+        var expectedScore = Map.of(
+                "103", 5.5,
+                "101", 5.0,
+                "102", 1.5,
+                "104", 0.5
+        );
+
+        var searchRes = search(List.of(departmentFunc, courseFunc, gradeFunc));
+        assertDocumentScore(searchRes, expectedScore);
+    }
+
+    @Test
+    public void testGaussFunctionScore_Number() throws IOException {
+        var students = SampleData.get();
+        createDocuments(students);
+
+        var placement = new DecayPlacement.Builder()
+                .origin(JsonData.of(100))
+                .offset(JsonData.of(15))
+                .scale(JsonData.of(10))
+                .decay(0.5)
+                .build();
+        var decayFunc = new DecayFunction.Builder()
+                .field("conductScore")
+                .placement(placement)
+                .build();
+        var gaussFunc = new FunctionScore.Builder()
+                .gauss(decayFunc)
+                .build();
+
+        var expectedScore = Map.of(
+                "103", 1.0,
+                "102", 0.9726,
+                "101", 0.4322,
+                "104", 0.2570
+        );
+
+        var searchRes = search(List.of(gaussFunc));
+        assertDocumentScore(searchRes, expectedScore);
+    }
+
+    @Test
+    public void testGaussFunctionScore_Date() throws IOException {
+        var students = SampleData.get();
+        createDocuments(students);
+
+        var now = new Date(1658592000000L);
+
+        var placement = new DecayPlacement.Builder()
+                .origin(JsonData.of(now.getTime()))
+                .offset(JsonData.of("90d"))
+                .scale(JsonData.of("270d"))
+                .decay(0.5)
+                .build();
+        var decayFunc = new DecayFunction.Builder()
+                .field("englishIssuedDate")
+                .placement(placement)
+                .build();
+        var gaussFunc = new FunctionScore.Builder()
+                .gauss(decayFunc)
+                .build();
+
+        var expectedScore = Map.of(
+                "102", 1.0,
+                "104", 0.8195,
+                "101", 0.2378,
+                "103", 0.1132
+        );
+
+        var searchRes = search(List.of(gaussFunc));
+        assertDocumentScore(searchRes, expectedScore);
+    }
+
     private CreateResponse createDocument(Student student) throws IOException {
         var createReq = new CreateRequest.Builder<Student>()
                 .index(INDEX_STUDENT)
@@ -371,6 +496,25 @@ public class EsClientTest {
         return client.search(searchReq, Student.class);
     }
 
+    private SearchResponse<Student> search(List<FunctionScore> functions) throws IOException {
+        var matchAllQuery = MatchAllQuery.of(b -> b)._toQuery();
+
+        var query = new FunctionScoreQuery.Builder()
+                .query(matchAllQuery)
+                .functions(functions)
+                .scoreMode(FunctionScoreMode.Sum)
+                .boostMode(FunctionBoostMode.Replace)
+                .maxBoost(100.0)
+                .build()
+                ._toQuery();
+
+        var searchReq = new SearchRequest.Builder()
+                .index(INDEX_STUDENT)
+                .query(query)
+                .build();
+        return client.search(searchReq, Student.class);
+    }
+
     private void assertDocumentIds(boolean ignoreOrder, SearchResponse<Student> res, String... expectedIdArray) {
         var actualIds = res
                 .hits()
@@ -387,6 +531,14 @@ public class EsClientTest {
         } else {
             assertEquals(expectedIds, actualIds);
         }
+    }
+
+    private void assertDocumentScore(SearchResponse<Student> res, Map<String, Double> expectedScoreMap) {
+        var actualScoreMap = new HashMap<String, Double>();
+        res.hits().hits().forEach(hit -> actualScoreMap.put(hit.id(), hit.score()));
+
+        expectedScoreMap.forEach((docId, score) ->
+                assertEquals(actualScoreMap.get(docId), score, 0.0001));
     }
 
 }
